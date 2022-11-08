@@ -545,8 +545,10 @@ void jitGatherKernelBase<isa>::generateForDynamicShapes() {
     jg(lBlockedCase, T_NEAR);
     {
         typename jitGatherKernelBase<isa>::template ShiftCalculatorImpl<ElementwiseCase, Long> elementwiseLong;
-        elementwiseLong.allocateRegisters(*this);
         uploadParamPtrWithVpbroadcastd(vmmSpecIdxSizeB, GET_OFF(specIndicesSize));
+
+        RegistersPool::Reg<Xbyak::Reg64> regSpecIdxSizeB{regPool, 13};
+        RegistersPool::Reg<Xbyak::Reg64> regBetweenBatchAndAxisSize{regPool, rbx.getIdx()};
 
         {
             poolVmm<isa> specIndices;
@@ -556,18 +558,17 @@ void jitGatherKernelBase<isa>::generateForDynamicShapes() {
             uni_vpslld(vmmSpecIdxB, specIndices, idxTypeShift); // multiply by indices type size.
             uni_vpslld(vmmSpecIdxSizeB, vmmSpecIdxSizeB, idxTypeShift); // multiply by indices type size.
 
-            RegistersPool::Reg<Xbyak::Reg64> &regSpecIdxSizeB = elementwiseLong.regSpecIdxSizeB;
             uni_vmovd(Xbyak::Reg32(regSpecIdxSizeB.getIdx()), Xbyak::Xmm(vmmSpecIdxSizeB.getIdx()));
 
             {
-                RegistersPool::Reg<Vmm> vAux1{regPool};
-                uploadParamPtrWithVpbroadcastd(vAux1, GET_OFF(betweenBatchAndAxisSize));
-                uni_vmovd(Xbyak::Reg32(elementwiseLong.regBetweenBatchAndAxisSize.getIdx()),
-                          Xbyak::Xmm(vAux1.getIdx()));
-                uni_vcvtdq2ps(vAux1, vAux1);
-                uni_vdivps(elementwiseLong.vmmIdxBatchSumB, generalIndices, vAux1);
+                RegistersPool::Reg<Vmm> vmmBetweenBatchAndAxisSize{regPool};
+                uploadParamPtrWithVpbroadcastd(vmmBetweenBatchAndAxisSize, GET_OFF(betweenBatchAndAxisSize));
+                uni_vmovd(Xbyak::Reg32(regBetweenBatchAndAxisSize.getIdx()), Xbyak::Xmm(vmmBetweenBatchAndAxisSize.getIdx()));
+                elementwiseLong.allocateRegistersForDynamicShapes(*this, std::move(regSpecIdxSizeB), std::move(regBetweenBatchAndAxisSize));
+                uni_vcvtdq2ps(vmmBetweenBatchAndAxisSize, vmmBetweenBatchAndAxisSize);
+                uni_vdivps(elementwiseLong.vmmIdxBatchSumB, generalIndices, vmmBetweenBatchAndAxisSize);
                 uni_vroundps(elementwiseLong.vmmIdxBatchSumB, elementwiseLong.vmmIdxBatchSumB, 0x1);
-                uni_vfnmadd231ps(generalIndices, elementwiseLong.vmmIdxBatchSumB, vAux1);
+                uni_vfnmadd231ps(generalIndices, elementwiseLong.vmmIdxBatchSumB, vmmBetweenBatchAndAxisSize);
             }
             uni_vcvtps2dq(vmmSrcBeforeAxisSumB, generalIndices);
         }
@@ -691,8 +692,21 @@ void jitGatherKernelBase<x64::avx2>::fillVlenVector(RegistersPool::Reg<Vmm>& vmm
 
 template<x64::cpu_isa_t isa> template<typename unused>
 void jitGatherKernelBase<isa>::ShiftCalculatorImpl<ElementwiseCase, Long, unused>::allocateRegisters(jitGatherKernelBase& kernel) {
-    regBetweenBatchAndAxisSize = Xbyak::Reg64(kernel.rbx.getIdx());
+    regBetweenBatchAndAxisSize = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, kernel.rbx.getIdx()};
     regSpecIdxSizeB = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, 13};
+    regBetweenBatchAndAxisIter = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, 15};
+    regIdxIter = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, 11};
+
+    vmmIdxBatchSumB = RegistersPool::Reg<Vmm>{kernel.regPool, 14};
+    vmmVecLenB = RegistersPool::Reg<Vmm>{kernel.regPool, 13};
+    vmmAxisAndAfterAxisSizeB = RegistersPool::Reg<Vmm>{kernel.regPool, kernel.vmmAxisAndAfterAxisSizeBIndx};
+}
+
+template<x64::cpu_isa_t isa> template<typename unused>
+void jitGatherKernelBase<isa>::ShiftCalculatorImpl<ElementwiseCase, Long, unused>::allocateRegistersForDynamicShapes(
+        jitGatherKernelBase& kernel, RegistersPool::Reg<Xbyak::Reg64>&& specIdxSizeB, RegistersPool::Reg<Xbyak::Reg64>&& betweenBatchAndAxisSize) {
+    regBetweenBatchAndAxisSize = std::move(betweenBatchAndAxisSize);
+    regSpecIdxSizeB = std::move(specIdxSizeB);
     regBetweenBatchAndAxisIter = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, 15};
     regIdxIter = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, 11};
 
@@ -716,7 +730,10 @@ template<x64::cpu_isa_t isa> template<typename unused>
 void jitGatherKernelBase<isa>::ShiftCalculatorImpl<ElementwiseCase, Long, unused>::uploadParamsForDynamicShapes(
         jitGatherKernelBase& kernel) {
 //    kernel.uni_vmovd(Xbyak::Reg32(regSpecIdxSizeB.getIdx()), Xbyak::Xmm(kernel.vmmSpecIdxSizeB.getIdx()));
-//
+//    RegistersPool::Reg<Xbyak::Reg64> regAux {kernel.regPool};
+//    kernel.mov(regAux, kernel.ptr[kernel.regParams + GET_OFF(betweenBatchAndAxisSize)]);
+//    kernel.mov(regBetweenBatchAndAxisSize, kernel.ptr[regAux]);
+
 //    {
 //        RegistersPool::Reg<Vmm> vmmBetweenBatchAndAxisSize{kernel.regPool};
 //        kernel.uploadParamPtrWithVpbroadcastd(vmmBetweenBatchAndAxisSize, GET_OFF(betweenBatchAndAxisSize));
