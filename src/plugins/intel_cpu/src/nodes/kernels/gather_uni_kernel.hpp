@@ -387,15 +387,26 @@ struct GatherShapeParameters {
         if (afterAxisSize == 1 && specIndicesSize < idxElPerVec) { // Elementwise short case.
             arg.permIdxMask = p.permIdxMask.data();
             arg.beforeAxisDiff = p.srcBeforeAxisDiff.data();
-        } else if (afterAxisSize > 1 && afterAxisSize <= dataElPerVec) { // Blocked short case.
-            arg.afterAxIdxB = p.afterAxIdxInBytes.data();
-            arg.specIdxDiff = p.specIdxDiff.data();
-            arg.beforeAxisDiff = p.srcBeforeAxisDiff.data();
-            arg.beforeAxisPermMask = p.beforeAxPermMask.data();
-            arg.afterAxisPermMask = p.afterAxPermMask.data();
-            arg.afterAxisSize = &afterAxisSize;
-            arg.specIdxAndAfterAxIterB = p.specIdxAndAfterAxIterB;
-            arg.specIdxAndAfterAxSizeB = specIdxAndAfterAxSizeB;
+        } else if (afterAxisSize > 1) { // Blocked case.
+//            if (afterAxisSize <= dataElPerVec) { // Short case
+                arg.afterAxIdxB = p.afterAxIdxInBytes.data();
+                arg.specIdxDiff = p.specIdxDiff.data();
+                arg.beforeAxisDiff = p.srcBeforeAxisDiff.data();
+                arg.beforeAxisPermMask = p.beforeAxPermMask.data();
+                arg.afterAxisPermMask = p.afterAxPermMask.data();
+                arg.afterAxisSize = &afterAxisSize;
+                arg.specIdxAndAfterAxIterB = p.specIdxAndAfterAxIterB;
+                arg.specIdxAndAfterAxSizeB = specIdxAndAfterAxSizeB;
+//            } else { // Long case
+//                arg.afterAxIdxB = p.afterAxIdxInBytes.data();
+//                arg.specIdxDiff = p.specIdxDiff.data();
+//                arg.beforeAxisDiff = p.srcBeforeAxisDiff.data();
+//                arg.beforeAxisPermMask = p.beforeAxPermMask.data();
+//                arg.afterAxisPermMask = p.afterAxPermMask.data();
+//                arg.afterAxisSize = &afterAxisSize;
+//                arg.specIdxAndAfterAxIterB = p.specIdxAndAfterAxIterB;
+//                arg.specIdxAndAfterAxSizeB = specIdxAndAfterAxSizeB;
+//            }
         }
         return arg;
     }
@@ -517,6 +528,7 @@ protected:
         void allocateRegisters(jitGatherKernelBase& kernel) override;
         void releaseRegisters();
         void uploadParamsForApproachSpecific(jitGatherKernelBase& kernel) override;
+        void uploadParamsForDynamicShapes(jitGatherKernelBase& kernel);
         std::tuple<poolVmask<isa> /*kDstMask*/, poolVmm<isa> /*vDstShifts*/> calcSrcShift(jitGatherKernelBase& kernel, bool shiftFirst) override;
 
         Xbyak::Reg64 regBetweenBatchAndAxisSize;
@@ -552,6 +564,28 @@ protected:
         RegistersPool::Reg<Vmm> vmmBeforeAxPermMask;
     };
 
+    template<typename unused>
+    struct ShiftCalculatorImpl<BlockedCase, Long, unused> : public ShiftCalculator {
+        void allocateRegisters(jitGatherKernelBase& kernel) override;
+        void uploadParamsForApproachSpecific(jitGatherKernelBase& kernel) override;
+        std::tuple<poolVmask<isa> /*kDstMask*/, poolVmm<isa> /*vDstShifts*/> calcSrcShift(jitGatherKernelBase& kernel, bool shiftFirst) override;
+
+        RegistersPool::Reg<Xbyak::Reg64> rSpecIdxAndAfterAxIterB;
+        RegistersPool::Reg<Xbyak::Reg64> rSpecIdxAndAfterAxSizeB;
+        RegistersPool::Reg<Xbyak::Reg64> rSpecIdxAndAfterAxSize;
+        RegistersPool::Reg<Xbyak::Reg64> rBeforeAxisSize;
+        RegistersPool::Reg<Xbyak::Reg64> rSpecIdxAndAfterAxisSizeIsPowerOf2;
+        RegistersPool::Reg<Xbyak::Reg64> rAfterAxisSizeIsPowerOf2;
+        RegistersPool::Reg<Xbyak::Reg64> rSpecIdxSize;
+
+        RegisterValue<Vmm> vmmAxisAndAfterAxisSizeB;
+        RegistersPool::Reg<Vmm> vmmSrcAfterBatchSizeB;
+        RegistersPool::Reg<Vmm> vmmAfterAxisIdxB;
+        RegistersPool::Reg<Vmm> vmmAfterAxisPermMask;
+        RegistersPool::Reg<Vmm> vmmSpecIdxDiff;
+        RegistersPool::Reg<Vmm> vmmAfterAxisSize;
+        RegistersPool::Reg<Vmm> vmmBeforeAxPermMask;
+    };
 
 public:
     void initialize(const jGatherConfParams& jcp) override;
@@ -585,6 +619,9 @@ protected:
     void storeVectorPart(const Xbyak::Reg& rDst, const Xbyak::Reg& rToStoreCounter, Vmm& vmmData);
     void generateForDynamicShapes();
     void generateForStaticShapes();
+    poolVmm<isa> getRangeFromStart();
+    std::tuple<poolVmm<isa> /*specIndices*/, poolVmm<isa> /*generalIndices*/> calculateSpecAndGenIndices(
+            Vmm& vmmSpecIndicesSizeB);
 
 protected:
     void (*ker_)(const gatherJitExecArgs *);
