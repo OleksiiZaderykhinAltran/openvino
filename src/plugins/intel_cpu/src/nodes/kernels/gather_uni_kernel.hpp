@@ -529,7 +529,8 @@ protected:
         void releaseRegisters();
         void uploadParamsForApproachSpecific(jitGatherKernelBase& kernel) override;
         void allocateRegistersForDynamicShapes(jitGatherKernelBase& kernel, RegistersPool::Reg<Xbyak::Reg64>&& regSpecIdxSizeB,
-            RegistersPool::Reg<Xbyak::Reg64>&& betweenBatchAndAxisSize);
+            RegistersPool::Reg<Xbyak::Reg64>&& betweenBatchAndAxisSize, RegistersPool::Reg<Xbyak::Reg64>&& betweenBatchAndAxisIter,
+            poolVmm<isa>&& vmmIdxBatchSumB, poolVmm<isa>&& vmmAxisAndAfterAxisSizeB);
         void uploadParamsForDynamicShapes(jitGatherKernelBase& kernel);
         std::tuple<poolVmask<isa> /*kDstMask*/, poolVmm<isa> /*vDstShifts*/> calcSrcShift(jitGatherKernelBase& kernel, bool shiftFirst) override;
 
