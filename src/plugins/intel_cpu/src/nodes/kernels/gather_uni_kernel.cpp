@@ -24,7 +24,8 @@ void jitGatherKernelBase<isa>::initialize(const jGatherConfParams& jcp) {
     reverseIndexing = jcp.reverseIndexing;
     afterAxisSize = jcp.afterAxisSize;
     dynamicShapes = jcp.dynamicShapes;
-    isLessSimdRegistersCase = isa != x64::avx512_core && afterAxisSize != 1 && !dynamicShapes && getDataTypeSize() != 4;
+    isLessSimdRegistersCase = isa != x64::avx512_core &&
+            (afterAxisSize <= idxElPerVec && afterAxisSize > 1) && !dynamicShapes && getDataTypeSize() != 4;
 }
 
 template<x64::cpu_isa_t isa>
@@ -94,6 +95,173 @@ void jitGatherKernelBase<isa>::process(ShiftCalculator& shiftCalculator) {
     L(lEndProc);
 }
 
+template <x64::cpu_isa_t isa>
+void jitGatherKernelBase<isa>::processLongBlock(ShiftCalculator& shiftCalculator) {
+    auto& blockedLong = dynamic_cast<ShiftCalculatorImpl<LongBlockCase, Long>&>(shiftCalculator);
+    Xbyak::Label lDstIdxLoop, lSkipMaskCombine, lEnd;
+    shl(regWorkAmount, getDataTypeShift());
+
+    // First iteration
+    {
+        RegistersPool::Reg<Vmm> vmmCalculatedShifts;
+        RegistersPool::Reg<Vmask> kLoadMask;
+        std::tie(kLoadMask, vmmCalculatedShifts) = shiftCalculator.calcSrcShift(*this, false);
+        copyBlock(shiftCalculator, kLoadMask, vmmCalculatedShifts);
+    }
+
+    // Main loop
+    L(lDstIdxLoop);
+    {
+        cmp(regWorkAmount, blockedLong.regAfterAxSizeB);
+        jl(lEnd, T_NEAR);
+        RegistersPool::Reg<Vmm> vmmCalculatedShifts;
+        RegistersPool::Reg<Vmask> kLoadMask;
+        std::tie(kLoadMask, vmmCalculatedShifts) = shiftCalculator.calcSrcShift(*this, true);
+        copyBlock(shiftCalculator, kLoadMask, vmmCalculatedShifts);
+
+        jmp(lDstIdxLoop, T_NEAR);
+    }
+
+    L(lEnd);
+}
+
+template <>
+void jitGatherKernelBase<x64::avx2>::copyBlock(ShiftCalculator& shiftCalculator, poolVmask<x64::avx2>& kLoadMask,
+                                               poolVmm<x64::avx2>& vmmCalculatedShifts) {
+    auto& blockedLong = dynamic_cast<ShiftCalculatorImpl<LongBlockCase, Long>&>(shiftCalculator);
+    static const uint32_t vlenXmm = x64::cpu_isa_traits<x64::sse41>::vlen;
+    Xbyak::Label lEnd;
+    RegistersPool::Reg<Xbyak::Xmm> xShifts {regPool};
+    RegistersPool::Reg<Xbyak::Xmm> xMask {regPool};
+    RegistersPool::Reg<Xbyak::Reg32> regShift {regPool};
+    for (int j = 0; j < simdVecSize / vlenXmm; j++) {
+        vextracti128(xMask, kLoadMask, j);
+        vextracti128(xShifts, vmmCalculatedShifts, j);
+
+        for (int k = 0; k < 4; k++) {
+            cmp(regWorkAmount, blockedLong.regAfterAxSizeB);
+            jl(lEnd, T_NEAR);
+
+            RegistersPool::Reg<Xbyak::Reg32> regMask {regPool};
+            uni_vpextrd(regMask, xMask, k);
+            Xbyak::Label lSkipByMask, lSkipByMaskEnd;
+            cmp(regMask, 0xffffffff);
+            regMask.release();
+            jne(lSkipByMask, T_NEAR);
+            {
+                uni_vpextrd(regShift, xShifts, k);
+                memCopy(regShift);
+            }
+            jmp(lSkipByMaskEnd, this->T_NEAR);
+            L(lSkipByMask);
+            {
+                // TODO: implement memZero(); // if indexes is out of range the reference implementation sets output to zeros
+            }
+            L(lSkipByMaskEnd);
+
+            sub(regWorkAmount, blockedLong.regAfterAxSizeB);
+        }
+    }
+    L(lEnd);
+}
+
+template <>
+void jitGatherKernelBase<x64::avx512_core>::copyBlock(ShiftCalculator& shiftCalculator, poolVmask<x64::avx512_core>& kGatherMask,
+                                               poolVmm<x64::avx512_core>& vmmCalculatedShifts) {
+    // TODO: implement this
+}
+
+template <x64::cpu_isa_t isa>
+void jitGatherKernelBase<isa>::memCopy(RegistersPool::Reg<Xbyak::Reg32>& regSrcShift) {
+    RegistersPool::Reg<Xbyak::Ymm> buf1 {regPool};
+    RegistersPool::Reg<Xbyak::Ymm> buf2 {regPool};
+    RegistersPool::Reg<Xbyak::Ymm> buf3 {regPool};
+    size_t size = afterAxisSize * getDataTypeSize();
+    RegistersPool::Reg<Xbyak::Reg64> regSrcShifted {regPool};
+    mov(regSrcShifted, regSrc);
+    add(regSrcShifted, regSrcShift);
+    const size_t ymmSize = x64::cpu_isa_traits<x64::avx>::vlen;
+    const size_t ymmSize3 = 3 * ymmSize;
+    if (size > ymmSize3) {
+        RegistersPool::Reg<Xbyak::Reg64> regThreshold {regPool};
+        mov(regThreshold, regSrcShifted);
+        add(regThreshold, (size/ymmSize3)*ymmSize3);
+        Xbyak::Label lLoop;
+        L(lLoop);
+        {
+            uni_vmovups(buf1, ptr[regSrcShifted]);
+            uni_vmovups(buf2, ptr[regSrcShifted + ymmSize]);
+            uni_vmovups(buf3, ptr[regSrcShifted + 2*ymmSize]);
+            uni_vmovups(ptr[regDst], buf1);
+            uni_vmovups(ptr[regDst + ymmSize], buf2);
+            uni_vmovups(ptr[regDst + 2*ymmSize], buf3);
+            add(regDst, ymmSize3);
+            add(regSrcShifted, ymmSize3);
+            cmp(regSrcShifted, regThreshold);
+            jl(lLoop, T_NEAR);
+        }
+        size %= ymmSize3;
+    }
+    if (size > ymmSize) {
+        if (size > 2 * ymmSize) {
+            uni_vmovups(buf1, ptr[regSrcShifted]);
+            uni_vmovups(buf2, ptr[regSrcShifted + ymmSize]);
+            uni_vmovups(buf3, ptr[regSrcShifted + (size - ymmSize)]);
+            uni_vmovups(ptr[regDst], buf1);
+            uni_vmovups(ptr[regDst + ymmSize], buf2);
+            uni_vmovups(ptr[regDst + (size - ymmSize)], buf3);
+        } else {
+            uni_vmovups(buf1, ptr[regSrcShifted]);
+            uni_vmovups(buf3, ptr[regSrcShifted + (size - ymmSize)]);
+            uni_vmovups(ptr[regDst], buf1);
+            uni_vmovups(ptr[regDst + (size - ymmSize)], buf3);
+        }
+    } else { // size <= ymmSize
+        size_t xmmSize = x64::cpu_isa_traits<x64::sse41>::vlen;
+        if (size > 8) {
+            if (size > 16) {
+                uni_vmovups(Xbyak::Xmm(buf1.getIdx()), ptr[regSrcShifted]);
+                uni_vmovups(Xbyak::Xmm(buf2.getIdx()), ptr[regSrcShifted + (size - xmmSize)]);
+                uni_vmovups(ptr[regDst], Xbyak::Xmm(buf1.getIdx()));
+                uni_vmovups(ptr[regDst + (size - xmmSize)], Xbyak::Xmm(buf2.getIdx()));
+            } else {
+                RegistersPool::Reg<Xbyak::Reg64> buf {regPool};
+                mov(buf, ptr[regSrcShifted]);
+                mov(ptr[regDst], buf);
+                mov(buf, ptr[regSrcShifted + (size - 8)]);
+                mov(ptr[regDst + (size - 8)], buf);
+            }
+        } else { // size <= 8
+            if (size > 2) {
+                if (size > 4) {
+                    RegistersPool::Reg<Xbyak::Reg32> buf{regPool};
+                    mov(buf, ptr[regSrcShifted]);
+                    mov(ptr[regDst], buf);
+                    mov(buf, ptr[regSrcShifted + (size - 4)]);
+                    mov(ptr[regDst + (size - 4)], buf);
+                } else { // size > 2
+                    RegistersPool::Reg<Xbyak::Reg16> buf{regPool};
+                    mov(buf, ptr[regSrcShifted]);
+                    mov(ptr[regDst], buf);
+                    mov(buf, ptr[regSrcShifted + (size - 2)]);
+                    mov(ptr[regDst + (size - 2)], buf);
+                }
+            } else { // size <= 2
+                if (size == 2) {
+                    RegistersPool::Reg<Xbyak::Reg16> buf{regPool};
+                    mov(buf, ptr[regSrcShifted]);
+                    mov(ptr[regDst], buf);
+                } else { // size == 1
+                    RegistersPool::Reg<Xbyak::Reg8> buf{regPool};
+                    mov(buf, ptr[regSrcShifted]);
+                    mov(ptr[regDst], buf);
+                }
+            }
+        }
+    }
+    add(regDst, size);
+}
+
 template <>
 void jitGatherKernelBase<x64::avx2>::combineMasks(Vmask& maskA, const Vmask& maskB) {
     vpand(maskA, maskA, maskB);
@@ -132,7 +300,7 @@ void jitGatherKernelBase<isa>::tail(ShiftCalculator& shiftCalculator, bool shift
         if (isLessSimdRegistersCase) {
             vmmSrcBeforeAxisSumB.loadFromStack(regPool, 8);
             auto& vmmAxisAndAfterAxisSizeB =
-                    dynamic_cast<typename jitGatherKernelBase<isa>::template ShiftCalculatorImpl<BlockedCase, Short>&>(shiftCalculator).
+                    dynamic_cast<typename jitGatherKernelBase<isa>::template ShiftCalculatorImpl<ShortBlockCase, Short>&>(shiftCalculator).
                             vmmAxisAndAfterAxisSizeB;
             if (vmmAxisAndAfterAxisSizeB.isInitialized()) {
                 vmmAxisAndAfterAxisSizeB.loadFromStack(this->regPool, this->vmmAxisAndAfterAxisSizeBIndx);
@@ -381,7 +549,7 @@ poolVmm<isa> jitGatherKernelForDataTypeSize<isa, DataType8bit>::calculateIdxShif
     if (this->isLessSimdRegistersCase) {
         this->vmmSrcBeforeAxisSumB.loadFromStack(this->regPool, 8);
         auto& vmmAxisAndAfterAxisSizeB =
-                dynamic_cast<typename jitGatherKernelBase<isa>::template ShiftCalculatorImpl<BlockedCase, Short>&>(shiftCalculator).
+                dynamic_cast<typename jitGatherKernelBase<isa>::template ShiftCalculatorImpl<ShortBlockCase, Short>&>(shiftCalculator).
                 vmmAxisAndAfterAxisSizeB;
         if (vmmAxisAndAfterAxisSizeB.isInitialized()) {
             vmmAxisAndAfterAxisSizeB.loadFromStack(this->regPool, this->vmmAxisAndAfterAxisSizeBIndx);
@@ -396,7 +564,7 @@ poolVmm<isa> jitGatherKernelForDataTypeSize<isa, DataType8bit>::calculateIdxShif
     if (this->isLessSimdRegistersCase) {
         this->vmmSrcBeforeAxisSumB.loadFromStack(this->regPool, 8);
         auto& vmmAxisAndAfterAxisSizeB =
-                dynamic_cast<typename jitGatherKernelBase<isa>::template ShiftCalculatorImpl<BlockedCase, Short>&>(shiftCalculator).
+                dynamic_cast<typename jitGatherKernelBase<isa>::template ShiftCalculatorImpl<ShortBlockCase, Short>&>(shiftCalculator).
                         vmmAxisAndAfterAxisSizeB;
         if (vmmAxisAndAfterAxisSizeB.isInitialized()) {
             vmmAxisAndAfterAxisSizeB.loadFromStack(this->regPool, this->vmmAxisAndAfterAxisSizeBIndx);
@@ -502,7 +670,11 @@ void jitGatherKernelBase<isa>::generateForStaticShapes() {
     }
     getShiftCalculator().allocateRegisters(*this);
     getShiftCalculator().uploadParamsForApproachSpecific(*this);
-    process(getShiftCalculator());
+    if (isLongBlock()) {
+        processLongBlock(getShiftCalculator());
+    } else {
+        process(getShiftCalculator());
+    }
 }
 
 template <x64::cpu_isa_t isa>
@@ -629,7 +801,7 @@ void jitGatherKernelBase<isa>::generateForDynamicShapes() {
         }
         this->jmp(lShortCaseEnd, this->T_NEAR);
         this->L(lShortCase); {
-            typename jitGatherKernelBase<isa>::template ShiftCalculatorImpl<BlockedCase, Short> blockedShort;
+            typename jitGatherKernelBase<isa>::template ShiftCalculatorImpl<ShortBlockCase, Short> blockedShort;
             this->uploadParamPtrWithVpbroadcastd(this->vmmSpecIdxSizeB, GET_OFF(specIndicesSize));
             this->uni_vpslld(this->vmmSpecIdxSizeB, this->vmmSpecIdxSizeB, this->idxTypeShift); // multiply by indexes type size.
 
@@ -752,7 +924,7 @@ void jitGatherKernelBase<isa>::ShiftCalculatorImpl<ElementwiseCase, Long, unused
 }
 
 template<x64::cpu_isa_t isa> template<typename unused>
-void jitGatherKernelBase<isa>::ShiftCalculatorImpl<BlockedCase, Short, unused>::allocateRegisters(jitGatherKernelBase& kernel) {
+void jitGatherKernelBase<isa>::ShiftCalculatorImpl<ShortBlockCase, Short, unused>::allocateRegisters(jitGatherKernelBase& kernel) {
     rSpecIdxAndAfterAxIterB = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, 11};
     rSpecIdxAndAfterAxSizeB = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, 13};
     if (kernel.dynamicShapes) {
@@ -771,7 +943,7 @@ void jitGatherKernelBase<isa>::ShiftCalculatorImpl<BlockedCase, Short, unused>::
 }
 
 template<x64::cpu_isa_t isa> template<typename unused>
-void jitGatherKernelBase<isa>::ShiftCalculatorImpl<BlockedCase, Short, unused>::uploadParamsForApproachSpecific(
+void jitGatherKernelBase<isa>::ShiftCalculatorImpl<ShortBlockCase, Short, unused>::uploadParamsForApproachSpecific(
         jitGatherKernelBase& kernel) {
     kernel.uploadParamPtrWithVmovups(vmmAfterAxisIdxB, GET_OFF(afterAxIdxB));
     kernel.uploadParamPtrWithVmovups(vmmAfterAxisPermMask, GET_OFF(afterAxisPermMask));
@@ -833,85 +1005,37 @@ void jitGatherKernelBase<isa>::ShiftCalculatorImpl<BlockedCase, Short, unused>::
 }
 
 template<x64::cpu_isa_t isa> template<typename unused>
-void jitGatherKernelBase<isa>::ShiftCalculatorImpl<BlockedCase, Long, unused>::allocateRegisters(jitGatherKernelBase& kernel) {
-    rSpecIdxAndAfterAxIterB = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, 11};
-    rSpecIdxAndAfterAxSizeB = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, 13};
-    if (kernel.dynamicShapes) {
-        rSpecIdxAndAfterAxSize = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, 14};
-        rBeforeAxisSize = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, 15};
-        rSpecIdxAndAfterAxisSizeIsPowerOf2 = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool};
-        rSpecIdxSize = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool};
-        rAfterAxisSizeIsPowerOf2 = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool};
-    }
+void jitGatherKernelBase<isa>::ShiftCalculatorImpl<LongBlockCase, Long, unused>::allocateRegisters(jitGatherKernelBase& kernel) {
+    regBetweenBatchAndAxisSize = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, kernel.rbx.getIdx()};
+    regSpecIdxSizeB = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, 13};
+    regBetweenBatchAndAxisIter = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, 15};
+    regIdxIter = RegistersPool::Reg<Xbyak::Reg64>{kernel.regPool, 11};
+    regAfterAxSizeB = RegistersPool::Reg<Xbyak::Reg64> {kernel.regPool};
 
-    vmmSrcAfterBatchSizeB = RegistersPool::Reg<Vmm>{kernel.regPool, 13};
-    vmmAfterAxisIdxB = RegistersPool::Reg<Vmm>{kernel.regPool, 15};
-    vmmAfterAxisPermMask = RegistersPool::Reg<Vmm>{kernel.regPool, 14};
-    vmmSpecIdxDiff = RegistersPool::Reg<Vmm>{kernel.regPool, 4};
+    vmmIdxBatchSumB = RegistersPool::Reg<Vmm>{kernel.regPool, 14};
+    vmmVecLenB = RegistersPool::Reg<Vmm>{kernel.regPool, 13};
+    vmmAxisAndAfterAxisSizeB = RegistersPool::Reg<Vmm>{kernel.regPool, kernel.vmmAxisAndAfterAxisSizeBIndx};
     vmmAfterAxisSize = RegistersPool::Reg<Vmm>{kernel.regPool, 5};
-    vmmBeforeAxPermMask = RegistersPool::Reg<Vmm>{kernel.regPool, 6};
 }
 
 template<x64::cpu_isa_t isa> template<typename unused>
-void jitGatherKernelBase<isa>::ShiftCalculatorImpl<BlockedCase, Long, unused>::uploadParamsForApproachSpecific(
+void jitGatherKernelBase<isa>::ShiftCalculatorImpl<LongBlockCase, Long, unused>::uploadParamsForApproachSpecific(
         jitGatherKernelBase& kernel) {
-    kernel.uploadParamPtrWithVmovups(vmmAfterAxisIdxB, GET_OFF(afterAxIdxB));
-    kernel.uploadParamPtrWithVmovups(vmmAfterAxisPermMask, GET_OFF(afterAxisPermMask));
-    kernel.uploadParamPtrWithVmovups(vmmSpecIdxDiff, GET_OFF(specIdxDiff));
-    kernel.uploadParamPtrWithVpbroadcastd(vmmSrcAfterBatchSizeB, GET_OFF(srcAfterBatchSizeB));
-    kernel.uploadParamPtrWithVpbroadcastd(vmmAfterAxisSize, GET_OFF(afterAxisSize));
-
-    if (kernel.dynamicShapes) {
-        kernel.mov(rSpecIdxSize, kernel.ptr[kernel.regParams + GET_OFF(specIdxSize)]);
-        kernel.mov(rAfterAxisSizeIsPowerOf2, kernel.ptr[kernel.regParams + GET_OFF(afterAxisSizeIsPowerOf2)]);
-        kernel.mov(rSpecIdxAndAfterAxSize, kernel.ptr[kernel.regParams + GET_OFF(specIdxAndAfterAxSize)]);
-        vmmAxisAndAfterAxisSizeB = RegisterValue<Vmm>{[&](Vmm &value) {
-            Xbyak::Label lBeforeAxisDiff, lEnd;
-            kernel.cmp(rSpecIdxAndAfterAxSize, kernel.idxElPerVec);
-            kernel.jl(lBeforeAxisDiff, kernel.T_NEAR); {
-            kernel.uploadParamPtrWithVpbroadcastd(value, GET_OFF(axisAndAfterAxisSizeB));
-        }
-            kernel.jmp(lEnd, kernel.T_NEAR);
-            kernel.L(lBeforeAxisDiff); {
-            kernel.uploadParamPtrWithVmovups(value, GET_OFF(beforeAxisDiff));
-        }
-            kernel.L(lEnd);
-        }};
-        kernel.mov(rBeforeAxisSize, kernel.ptr[kernel.regParams + GET_OFF(beforeAxisSize)]);
-        kernel.mov(rSpecIdxAndAfterAxisSizeIsPowerOf2, kernel.ptr[kernel.regParams + GET_OFF(specIdxAndAfterAxisSizeIsPowerOf2)]);
-
-        Xbyak::Label lEnd, lBeforeAxPermMaskUploadEnd;
-        kernel.cmp(rBeforeAxisSize, 1);
-        kernel.je(lEnd, kernel.T_NEAR); {
-            kernel.mov(rSpecIdxAndAfterAxIterB, kernel.ptr[kernel.regParams + GET_OFF(specIdxAndAfterAxIterB)]);
-            kernel.mov(rSpecIdxAndAfterAxSizeB, kernel.ptr[kernel.regParams + GET_OFF(specIdxAndAfterAxSizeB)]);
-            vmmAxisAndAfterAxisSizeB.initialize(kernel.regPool, kernel.vmmAxisAndAfterAxisSizeBIndx);
-            kernel.cmp(rSpecIdxAndAfterAxisSizeIsPowerOf2, 1);
-            kernel.je(lBeforeAxPermMaskUploadEnd, kernel.T_NEAR); {
-                kernel.uploadParamPtrWithVmovups(vmmBeforeAxPermMask, GET_OFF(beforeAxisPermMask));
-            }
-            kernel.L(lBeforeAxPermMaskUploadEnd);
-        }
-        kernel.L(lEnd);
-    } else {
-        vmmAxisAndAfterAxisSizeB = RegisterValue<Vmm>{[&](Vmm &value) {
-            if (kernel.specIdxSize * kernel.afterAxisSize < kernel.idxElPerVec) {
-                kernel.uploadParamPtrWithVmovups(value, GET_OFF(beforeAxisDiff));
-            } else {
-                kernel.uploadParamPtrWithVpbroadcastd(value, GET_OFF(axisAndAfterAxisSizeB));
-            }
-        }};
-        if (kernel.beforeAxisSize != 1lu) {
-            kernel.mov(rSpecIdxAndAfterAxIterB, kernel.ptr[kernel.regParams + GET_OFF(specIdxAndAfterAxIterB)]);
-            kernel.mov(rSpecIdxAndAfterAxSizeB, kernel.ptr[kernel.regParams + GET_OFF(specIdxAndAfterAxSizeB)]);
-            vmmAxisAndAfterAxisSizeB.initialize(kernel.regPool, kernel.vmmAxisAndAfterAxisSizeBIndx);
-            const uint64_t specIdxAndAfterAxisSize = kernel.specIdxSize * kernel.afterAxisSize;
-            if (specIdxAndAfterAxisSize != 1 && specIdxAndAfterAxisSize != 2 && specIdxAndAfterAxisSize != 4 &&
-                specIdxAndAfterAxisSize != 8 && specIdxAndAfterAxisSize != 16) {
-                kernel.uploadParamPtrWithVmovups(vmmBeforeAxPermMask, GET_OFF(beforeAxisPermMask));
-            }
-        }
+    kernel.uni_vmovd(Xbyak::Reg32(regSpecIdxSizeB.getIdx()), Xbyak::Xmm(kernel.vmmSpecIdxSizeB.getIdx()));
+    if (kernel.beforeAxisSize != 1lu) {
+        kernel.uploadParamPtrWithVpbroadcastd(vmmAxisAndAfterAxisSizeB, GET_OFF(axisAndAfterAxisSizeB));
     }
+    kernel.uploadParamPtrWithVmovups(vmmIdxBatchSumB, GET_OFF(idxBatchSumB));
+    RegistersPool::Reg<Xbyak::Reg64> regAux {kernel.regPool};
+    kernel.mov(regAux, kernel.ptr[kernel.regParams + GET_OFF(betweenBatchAndAxisSize)]);
+    kernel.mov(regBetweenBatchAndAxisSize, kernel.ptr[regAux]);
+    kernel.mov(regBetweenBatchAndAxisIter, kernel.ptr[kernel.regParams + GET_OFF(betweenBatchAndAxisIter)]);
+
+    kernel.uni_vmovd(Xbyak::Reg32(regIdxIter.getIdx()), Xbyak::Xmm(kernel.vmmSpecIdxB.getIdx()));
+    kernel.fillVlenVector(vmmVecLenB);
+    kernel.uploadParamPtrWithVpbroadcastd(vmmAfterAxisSize, GET_OFF(afterAxisSize));
+    kernel.mov(regAfterAxSizeB, kernel.ptr[kernel.regParams + GET_OFF(afterAxSize)]);
+    kernel.shl(regAfterAxSizeB, kernel.getDataTypeShift());
 }
 
 
@@ -1003,7 +1127,7 @@ void jitGatherKernelBase<x64::avx512_core>::normWithUpperBound(Vmm& vTarget, Vmm
 
 template<x64::cpu_isa_t isa> template<typename unused>
 std::tuple<poolVmask<isa> /*kDstMask*/, poolVmm<isa> /*vDstShifts*/>
-jitGatherKernelBase<isa>::ShiftCalculatorImpl<BlockedCase, Short, unused>::calcSrcShift(
+jitGatherKernelBase<isa>::ShiftCalculatorImpl<ShortBlockCase, Short, unused>::calcSrcShift(
         jitGatherKernelBase& kernel, bool shiftFirst) {
     if (kernel.dynamicShapes) {
         RegistersPool::Reg<Vmm> vBeforeAxisSumB{kernel.regPool};
@@ -1254,252 +1378,108 @@ jitGatherKernelBase<isa>::ShiftCalculatorImpl<BlockedCase, Short, unused>::calcS
 
 template<x64::cpu_isa_t isa> template<typename unused>
 std::tuple<poolVmask<isa> /*kDstMask*/, poolVmm<isa> /*vDstShifts*/>
-jitGatherKernelBase<isa>::ShiftCalculatorImpl<BlockedCase, Long, unused>::calcSrcShift(
+jitGatherKernelBase<isa>::ShiftCalculatorImpl<LongBlockCase, Long, unused>::calcSrcShift(
         jitGatherKernelBase& kernel, bool shiftFirst) {
-    if (kernel.dynamicShapes) {
-        RegistersPool::Reg<Vmm> vBeforeAxisSumB{kernel.regPool};
-        if (shiftFirst) {
-            if (kernel.isLessSimdRegistersCase) {
-                kernel.vmmZeros.reset();
-            }
-            Xbyak::Label lNormSpecIdxBEnd;
-            kernel.cmp(rSpecIdxSize, 1);
-            kernel.je(lNormSpecIdxBEnd, kernel.T_NEAR); {
-                kernel.uni_vpaddd(kernel.vmmSpecIdxB, kernel.vmmSpecIdxB, vmmSpecIdxDiff);
-                kernel.normWithUpperBound(kernel.vmmSpecIdxB, kernel.vmmSpecIdxSizeB);
-            }
-            kernel.L(lNormSpecIdxBEnd);
-
-            Xbyak::Label lPermAfterAxisIdxBEnd;
-            kernel.cmp(rAfterAxisSizeIsPowerOf2, 1);
-            kernel.je(lPermAfterAxisIdxBEnd, kernel.T_NEAR); {
-                // No sense to permute if afterAxisSize is one of {1, 2, 4, 8, 16}
-                kernel.vpermd(vmmAfterAxisIdxB, vmmAfterAxisPermMask, vmmAfterAxisIdxB);
-
-                Xbyak::Label lPermSpecIdxDiffEnd;
-                kernel.cmp(rSpecIdxSize, 1);
-                kernel.je(lPermSpecIdxDiffEnd, kernel.T_NEAR); {
-                    kernel.vpermd(vmmSpecIdxDiff, vmmAfterAxisPermMask, vmmSpecIdxDiff);
-                }
-                kernel.L(lPermSpecIdxDiffEnd);
-            }
-            kernel.L(lPermAfterAxisIdxBEnd);
-
-            Xbyak::Label lBeforeAxisSumBCalculationEnd;
-            kernel.cmp(rBeforeAxisSize, 1);
-            kernel.je(lBeforeAxisSumBCalculationEnd, kernel.T_NEAR); {
-                Xbyak::Label lGreaterThenVec, lGreaterThenVecEnd;
-                kernel.cmp(rSpecIdxAndAfterAxSize, kernel.idxElPerVec);
-                kernel.jg(lGreaterThenVec, kernel.T_NEAR); {
-                    auto &vmmBeforeAxDiffB = vmmAxisAndAfterAxisSizeB;
-                    kernel.uni_vpaddd(kernel.vmmSrcBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB, vmmBeforeAxDiffB);
-                    kernel.uni_vmovups(vBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB);
-
-                    Xbyak::Label lBeforeAxDiffBPermEnd;
-                    kernel.cmp(rSpecIdxAndAfterAxisSizeIsPowerOf2, 1);
-                    kernel.je(lBeforeAxDiffBPermEnd, kernel.T_NEAR); {
-                        kernel.vpermd(vmmBeforeAxDiffB, vmmBeforeAxPermMask, vmmBeforeAxDiffB);
-                    }
-                    kernel.L(lBeforeAxDiffBPermEnd);
-                }
-                kernel.jmp(lGreaterThenVecEnd, kernel.T_NEAR);
-                kernel.L(lGreaterThenVec); {
-                    Xbyak::Label lBeforeAxStep, lBeforeAxStepEnd;
-                    kernel.add(rSpecIdxAndAfterAxIterB, kernel.idxElPerVec * kernel.getDataTypeSize());
-                    kernel.cmp(rSpecIdxAndAfterAxIterB, rSpecIdxAndAfterAxSizeB);
-                    kernel.jl(lBeforeAxStep, kernel.T_NEAR); {
-                        kernel.sub(rSpecIdxAndAfterAxIterB, rSpecIdxAndAfterAxSizeB);
-
-                        RegistersPool::Reg<Vmm> vAux0{kernel.regPool};
-                        kernel.vpmulld(vAux0, kernel.vmmSpecIdxB, vmmAfterAxisSize);
-                        kernel.uni_vpaddd(vAux0, vAux0, vmmAfterAxisIdxB);
-                        kernel.uni_vpbroadcastd(vBeforeAxisSumB, Xbyak::Xmm(vAux0.getIdx()));
-                        if (isa == x64::avx512_core) {
-                            RegistersPool::Reg<Xbyak::Opmask> kMask0{kernel.regPool};
-                            kernel.vpcmpgtd(kMask0, vBeforeAxisSumB, vAux0);
-                            kernel.uni_vmovups(vBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB);
-                            kernel.uni_vpaddd(static_cast<Vmm &>(vBeforeAxisSumB) | kMask0, kernel.vmmSrcBeforeAxisSumB,
-                                              vmmAxisAndAfterAxisSizeB);
-                        } else {
-                            kernel.vpcmpgtd(vBeforeAxisSumB, vBeforeAxisSumB, vAux0);
-                            kernel.vpand(vBeforeAxisSumB, vBeforeAxisSumB, vmmAxisAndAfterAxisSizeB);
-                            kernel.uni_vpaddd(vBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB, vBeforeAxisSumB);
-                        }
-                        kernel.uni_vpaddd(kernel.vmmSrcBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB,
-                                          vmmAxisAndAfterAxisSizeB);
-                    }
-                    kernel.jmp(lBeforeAxStepEnd);
-                    kernel.L(lBeforeAxStep); {
-                        kernel.uni_vmovups(vBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB);
-                    }
-                    kernel.L(lBeforeAxStepEnd);
-                }
-                kernel.L(lGreaterThenVecEnd);
-            }
-            kernel.L(lBeforeAxisSumBCalculationEnd);
-            if (kernel.isLessSimdRegistersCase) {
-                kernel.vmmZeros.initialize(kernel.regPool, kernel.vmmZerosIdx);
-            }
-        } else {
-            Xbyak::Label lBeforeAxisSumBCalculationEnd;
-            kernel.cmp(rBeforeAxisSize, 1);
-            kernel.je(lBeforeAxisSumBCalculationEnd, kernel.T_NEAR); {
-                kernel.uni_vmovups(vBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB);
-
-
-                Xbyak::Label lLessOrEqualThenVec;
-                kernel.cmp(rSpecIdxAndAfterAxSize, kernel.idxElPerVec);
-                kernel.jle(lLessOrEqualThenVec, kernel.T_NEAR); {
-                    // Broadcast the last element.
-                    if (isa == x64::avx512_core) {
-                        kernel.vshuff64x2(kernel.vmmSrcBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB,
-                                          kernel.vmmSrcBeforeAxisSumB, 0xFF);
-                    } else {
-                        kernel.vpermq(kernel.vmmSrcBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB, 0xFF);
-                    }
-                    kernel.vpshufd(kernel.vmmSrcBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB, 0xFF);
-
-                    Xbyak::Label lBeforeAxStepEnd1;
-                    kernel.add(rSpecIdxAndAfterAxIterB, kernel.idxElPerVec * kernel.getDataTypeSize());
-                    kernel.cmp(rSpecIdxAndAfterAxIterB, rSpecIdxAndAfterAxSizeB);
-                    kernel.jl(lBeforeAxStepEnd1, kernel.T_NEAR); {
-                        kernel.sub(rSpecIdxAndAfterAxIterB, rSpecIdxAndAfterAxSizeB);
-                        kernel.cmp(rSpecIdxAndAfterAxIterB, 0);
-                        kernel.jne(lBeforeAxStepEnd1, kernel.T_NEAR); {
-                            kernel.uni_vpaddd(kernel.vmmSrcBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB,
-                                              vmmAxisAndAfterAxisSizeB);
-                        }
-                    }
-                    kernel.L(lBeforeAxStepEnd1);
-                }
-                kernel.L(lLessOrEqualThenVec);
-            }
-            kernel.L(lBeforeAxisSumBCalculationEnd);
-        }
-        if (kernel.isLessSimdRegistersCase) {
-            kernel.vmmSrcBeforeAxisSumB.saveToStack(kernel.stackAllocator);
-            if (vmmAxisAndAfterAxisSizeB.isInitialized()) {
-                vmmAxisAndAfterAxisSizeB.saveToStack(kernel.stackAllocator);
-            }
-        }
-
-        RegistersPool::Reg<Vmm> vDstShifts;
+    if (isa == x64::avx2) {
+        // TODO: some tests fails for this implementation
+        Xbyak::Label lIdxStride, lExit;
+        if (shiftFirst)
+            kernel.uni_vpaddd(kernel.vmmSpecIdxB, kernel.vmmSpecIdxB, vmmVecLenB);
+        kernel.add(regIdxIter, kernel.simdVecSize);
+        kernel.cmp(regIdxIter, regSpecIdxSizeB);
+        kernel.jge(lIdxStride, kernel.T_NEAR);
         RegistersPool::Reg<Vmask> kDstMask;
-        std::tie(kDstMask, vDstShifts) = kernel.calculateIndexesForShortCase(vBeforeAxisSumB, vmmSrcAfterBatchSizeB);
-
-        kernel.vpmulld(vDstShifts, vDstShifts, vmmAfterAxisSize);
-        kernel.uni_vpaddd(vDstShifts, vDstShifts, vmmAfterAxisIdxB);
-
-        Xbyak::Label lBeforeAxisSumBAdditionEnd;
-        kernel.cmp(rBeforeAxisSize, 1);
-        kernel.je(lBeforeAxisSumBAdditionEnd, kernel.T_NEAR); {
-            kernel.uni_vpaddd(vDstShifts, vDstShifts, vBeforeAxisSumB);
+        RegistersPool::Reg<Vmm> vDstShifts {kernel.regPool};
+        {
+            RegistersPool::Reg<Xbyak::Reg32> reg32Aux1{kernel.regPool};
+            if (kernel.batchDims > 0lu) {
+                kernel.uni_vpaddd(vDstShifts, vmmIdxBatchSumB, kernel.vmmSpecIdxB);
+                kernel.uni_vmovd(reg32Aux1, Xbyak::Xmm(vDstShifts.getIdx()));
+            } else {
+                kernel.uni_vmovd(reg32Aux1, Xbyak::Xmm(kernel.vmmSpecIdxB.getIdx()));
+            }
+            kernel.vmovdqu(vDstShifts, kernel.ptr[kernel.regIndices + Xbyak::Reg64(reg32Aux1.getIdx())]);
+            kDstMask = kernel.normalizeIndexesAndCalcShifts(vDstShifts);
+            kernel.vpmulld(vDstShifts, vDstShifts, vmmAfterAxisSize);
+            if (kernel.beforeAxisSize != 1lu)
+                kernel.uni_vpaddd(vDstShifts, vDstShifts, kernel.vmmSrcBeforeAxisSumB);
         }
-        kernel.L(lBeforeAxisSumBAdditionEnd);
-        return {std::move(kDstMask), std::move(vDstShifts)};
-    } else {
-        RegistersPool::Reg<Vmm> vBeforeAxisSumB{kernel.regPool};
-        const uint64_t specIdxAndAfterAxisSize = kernel.specIdxSize * kernel.afterAxisSize;
-        if (shiftFirst) {
-            if (kernel.isLessSimdRegistersCase) {
-                kernel.vmmZeros.reset();
-            }
-            if (kernel.specIdxSize != 1) {
-                kernel.uni_vpaddd(kernel.vmmSpecIdxB, kernel.vmmSpecIdxB, vmmSpecIdxDiff);
-                kernel.normWithUpperBound(kernel.vmmSpecIdxB, kernel.vmmSpecIdxSizeB);
-            }
-            // No sense to permute if afterAxisSize is one of {1, 2, 4, 8, 16}. 0 is reserved for dynamic case.
-            if (kernel.afterAxisSize != 2 && kernel.afterAxisSize != 4 &&
-                kernel.afterAxisSize != 8 && kernel.afterAxisSize != 16) {
-                kernel.vpermd(vmmAfterAxisIdxB, vmmAfterAxisPermMask, vmmAfterAxisIdxB);
-                if (kernel.specIdxSize != 1)
-                    kernel.vpermd(vmmSpecIdxDiff, vmmAfterAxisPermMask, vmmSpecIdxDiff);
-            }
-
-            if (kernel.beforeAxisSize != 1lu) {
-                if (specIdxAndAfterAxisSize > 0lu && specIdxAndAfterAxisSize <= kernel.idxElPerVec) {
-                    auto &vmmBeforeAxDiffB = vmmAxisAndAfterAxisSizeB;
-                    kernel.uni_vpaddd(kernel.vmmSrcBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB, vmmBeforeAxDiffB);
-                    kernel.uni_vmovups(vBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB);
-                    if (specIdxAndAfterAxisSize != 1 && specIdxAndAfterAxisSize != 2 &&
-                        specIdxAndAfterAxisSize != 4 &&
-                        specIdxAndAfterAxisSize != 8 && specIdxAndAfterAxisSize != 16)
-                        kernel.vpermd(vmmBeforeAxDiffB, vmmBeforeAxPermMask, vmmBeforeAxDiffB);
+        kernel.jmp(lExit, kernel.T_NEAR);
+        kernel.L(lIdxStride);
+        {
+            kernel.sub(regIdxIter, regSpecIdxSizeB);
+            RegistersPool::Reg<Vmm> vAux0;
+            RegistersPool::Reg<Vmm> vAux1{kernel.regPool};
+            kernel.vpcmpeqd(kDstMask, vAux1, vAux1);
+            if (shiftFirst) {
+                vAux0 = RegistersPool::Reg<Vmm>{kernel.regPool};
+                kernel.vpcmpgtd(vAux0, kernel.vmmSpecIdxSizeB, kernel.vmmSpecIdxB);
+                kernel.vpandn(vAux1, vAux0, kernel.vmmSpecIdxSizeB);
+                kernel.uni_vpsubd(vAux1, kernel.vmmSpecIdxB, vAux1);
+                if (kernel.batchDims > 0lu)
+                    kernel.uni_vpaddd(vAux1, vmmIdxBatchSumB, vAux1);
+                kernel.uni_vpsubd(kernel.vmmSpecIdxB, kernel.vmmSpecIdxB, kernel.vmmSpecIdxSizeB);
+            } else {
+                if (kernel.batchDims > 0lu) {
+                    RegistersPool::Reg<Vmm> vAux{kernel.regPool};
+                    kernel.uni_vpaddd(vAux, vmmIdxBatchSumB, kernel.vmmSpecIdxB);
+                    kernel.uniVpGatherDd(vDstShifts, kernel.ptr[kernel.regIndices + vAux], kDstMask);
                 } else {
-                    Xbyak::Label lBeforeAxStep, lBeforeAxStepEnd;
-                    kernel.add(rSpecIdxAndAfterAxIterB, kernel.idxElPerVec * kernel.getDataTypeSize());
-                    kernel.cmp(rSpecIdxAndAfterAxIterB, rSpecIdxAndAfterAxSizeB);
-                    kernel.jl(lBeforeAxStep, kernel.T_NEAR);
-                    kernel.sub(rSpecIdxAndAfterAxIterB, rSpecIdxAndAfterAxSizeB);
+                    kernel.uniVpGatherDd(vDstShifts, kernel.ptr[kernel.regIndices + kernel.vmmSpecIdxB], kDstMask);
+                }
+                kDstMask = kernel.normalizeIndexesAndCalcShifts(vDstShifts, std::move(kDstMask));
+                kernel.vpmulld(vDstShifts, vDstShifts, vmmAfterAxisSize);
 
-                    RegistersPool::Reg<Vmm> vAux0{kernel.regPool};
-                    kernel.vpmulld(vAux0, kernel.vmmSpecIdxB, vmmAfterAxisSize);
-                    kernel.uni_vpaddd(vAux0, vAux0, vmmAfterAxisIdxB);
-                    kernel.uni_vpbroadcastd(vBeforeAxisSumB, Xbyak::Xmm(vAux0.getIdx()));
-                    if (isa == x64::avx512_core) {
-                        RegistersPool::Reg<Xbyak::Opmask> kMask0{kernel.regPool};
-                        kernel.vpcmpgtd(kMask0, vBeforeAxisSumB, vAux0);
-                        kernel.uni_vmovups(vBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB);
-                        kernel.uni_vpaddd(static_cast<Vmm &>(vBeforeAxisSumB) | kMask0, kernel.vmmSrcBeforeAxisSumB,
-                                          vmmAxisAndAfterAxisSizeB);
-                    } else {
-                        kernel.vpcmpgtd(vBeforeAxisSumB, vBeforeAxisSumB, vAux0);
-                        kernel.vpand(vBeforeAxisSumB, vBeforeAxisSumB, vmmAxisAndAfterAxisSizeB);
-                        kernel.uni_vpaddd(vBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB, vBeforeAxisSumB);
-                    }
-                    kernel.uni_vpaddd(kernel.vmmSrcBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB,
-                                      vmmAxisAndAfterAxisSizeB);
-                    kernel.jmp(lBeforeAxStepEnd);
-                    kernel.L(lBeforeAxStep);
-                    kernel.uni_vmovups(vBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB);
-                    kernel.L(lBeforeAxStepEnd);
+                vAux0 = RegistersPool::Reg<Vmm>{kernel.regPool};
+                kernel.uni_vpbroadcastd(vAux0, Xbyak::Xmm(kernel.vmmSpecIdxB.getIdx()));
+                kernel.vpcmpgtd(vAux1, vAux0, kernel.vmmSpecIdxB);
+                kernel.vpandn(vAux0, vAux1, kernel.vmmSpecIdxSizeB);
+                kernel.uni_vpsubd(kernel.vmmSpecIdxB, kernel.vmmSpecIdxB, vAux0);
+
+                if (kernel.beforeAxisSize != 1lu) {
+                    kernel.uni_vpaddd(vDstShifts, vDstShifts, kernel.vmmSrcBeforeAxisSumB);
+                    kernel.vpandn(vAux0, vAux1, vmmAxisAndAfterAxisSizeB);
+                    kernel.uni_vpaddd(kernel.vmmSrcBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB, vAux0);
                 }
             }
-            if (kernel.isLessSimdRegistersCase) {
-                kernel.vmmZeros.initialize(kernel.regPool, kernel.vmmZerosIdx);
-            }
-        } else {
-            if (kernel.beforeAxisSize != 1lu) {
-                kernel.uni_vmovups(vBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB);
-                if (specIdxAndAfterAxisSize > kernel.idxElPerVec) {
-                    // Broadcast the last element.
-                    if (isa == x64::avx512_core) {
-                        kernel.vshuff64x2(kernel.vmmSrcBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB,
-                                          kernel.vmmSrcBeforeAxisSumB, 0xFF);
-                    } else {
-                        kernel.vpermq(kernel.vmmSrcBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB, 0xFF);
-                    }
-                    kernel.vpshufd(kernel.vmmSrcBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB, 0xFF);
 
-                    Xbyak::Label lBeforeAxStepEnd1;
-                    kernel.add(rSpecIdxAndAfterAxIterB, kernel.idxElPerVec * kernel.getDataTypeSize());
-                    kernel.cmp(rSpecIdxAndAfterAxIterB, rSpecIdxAndAfterAxSizeB);
-                    kernel.jl(lBeforeAxStepEnd1, kernel.T_NEAR);
-                    kernel.sub(rSpecIdxAndAfterAxIterB, rSpecIdxAndAfterAxSizeB);
-                    kernel.cmp(rSpecIdxAndAfterAxIterB, 0);
-                    kernel.jne(lBeforeAxStepEnd1, kernel.T_NEAR);
+            if (kernel.batchDims > 0lu) {
+                Xbyak::Label l1;
+                kernel.inc(regBetweenBatchAndAxisIter);
+                kernel.cmp(regBetweenBatchAndAxisIter, regBetweenBatchAndAxisSize);
+                kernel.jl(l1, kernel.T_NEAR);
+                kernel.mov(regBetweenBatchAndAxisIter, 0);
+                if (shiftFirst) {
+                    kernel.uni_vpaddd(vmmIdxBatchSumB, vmmIdxBatchSumB, kernel.vmmSpecIdxSizeB);
+                    kernel.vpandn(vDstShifts, vAux0, kernel.vmmSpecIdxSizeB);
+                    kernel.uni_vpaddd(vAux1, vAux1, vDstShifts);
+                } else {
+                    kernel.vpandn(vAux0, vAux1, kernel.vmmSpecIdxSizeB);
+                    kernel.uni_vpaddd(vmmIdxBatchSumB, vmmIdxBatchSumB, vAux0);
+                }
+                kernel.L(l1);
+            }
+
+            if (shiftFirst) {
+                kernel.uniVpGatherDd(vDstShifts, kernel.ptr[kernel.regIndices + vAux1], kDstMask);
+                vAux1.release();
+                kDstMask = kernel.normalizeIndexesAndCalcShifts(vDstShifts, std::move(kDstMask));
+                kernel.vpmulld(vDstShifts, vDstShifts, vmmAfterAxisSize);
+
+                if (kernel.beforeAxisSize != 1lu) {
+                    kernel.vpandn(vAux0, vAux0, vmmAxisAndAfterAxisSizeB);
+                    kernel.uni_vpaddd(vAux0, vAux0, kernel.vmmSrcBeforeAxisSumB);
                     kernel.uni_vpaddd(kernel.vmmSrcBeforeAxisSumB, kernel.vmmSrcBeforeAxisSumB,
                                       vmmAxisAndAfterAxisSizeB);
-                    kernel.L(lBeforeAxStepEnd1);
+
+                    kernel.uni_vpaddd(vDstShifts, vDstShifts, vAux0);
                 }
             }
         }
-        if (kernel.isLessSimdRegistersCase) {
-            kernel.vmmSrcBeforeAxisSumB.saveToStack(kernel.stackAllocator);
-            if (vmmAxisAndAfterAxisSizeB.isInitialized()) {
-                vmmAxisAndAfterAxisSizeB.saveToStack(kernel.stackAllocator);
-            }
-        }
-
-        RegistersPool::Reg<Vmm> vDstShifts;
-        RegistersPool::Reg<Vmask> kDstMask;
-        std::tie(kDstMask, vDstShifts) = kernel.calculateIndexesForShortCase(vBeforeAxisSumB, vmmSrcAfterBatchSizeB);
-
-        kernel.vpmulld(vDstShifts, vDstShifts, vmmAfterAxisSize);
-        kernel.uni_vpaddd(vDstShifts, vDstShifts, vmmAfterAxisIdxB);
-        if (kernel.beforeAxisSize != 1lu)
-            kernel.uni_vpaddd(vDstShifts, vDstShifts, vBeforeAxisSumB);
+        kernel.L(lExit);
         return {std::move(kDstMask), std::move(vDstShifts)};
+    } else if (isa == x64::avx512_core) {
+        // TODO: implement this
     }
 }
 
@@ -1699,20 +1679,24 @@ jitGatherKernelBase<isa>::ShiftCalculatorImpl<ElementwiseCase, Long, unused>::ca
 
 
 template <x64::cpu_isa_t isa, DataTypeSize S, AfterAxisCase C>
-std::shared_ptr<jitGatherKernelInterface> createJitUniGatherKernel(bool isShortCase) {
-    if (isShortCase)
+std::shared_ptr<jitGatherKernelInterface> createJitUniGatherKernel(bool isShortApproach) {
+    if (isShortApproach)
         return std::make_shared<jitGatherKernelForStaticShapes<isa, S, C, Short>>();
-    if (C == ElementwiseCase)
-        return std::make_shared<jitGatherKernelForStaticShapes<isa, S, C, Long>>();
-    return {}; // BlockedCase Long not implemented
-//    return std::make_shared<jitGatherKernelForStaticShapes<isa, S, C, Long>>();
+    return std::make_shared<jitGatherKernelForStaticShapes<isa, S, C, Long>>();
 }
 
 template <x64::cpu_isa_t isa, DataTypeSize S>
 std::shared_ptr<jitGatherKernelInterface> createJitUniGatherKernel(uint64_t afterAxisSize, uint64_t specIdxSize, uint64_t idxElPerVec) {
-    if (afterAxisSize == 1lu)
-        return createJitUniGatherKernel<isa, S, ElementwiseCase>(specIdxSize < idxElPerVec);
-    return createJitUniGatherKernel<isa, S, BlockedCase>(afterAxisSize <= idxElPerVec);
+    bool isShortApproach = specIdxSize < idxElPerVec;
+    if (afterAxisSize == 1lu) { // ElementwiseCase
+        return createJitUniGatherKernel<isa, S, ElementwiseCase>(isShortApproach);
+    } else if (afterAxisSize <= idxElPerVec) { // ShortBlockCase
+        return createJitUniGatherKernel<isa, S, ShortBlockCase>(isShortApproach);
+    }
+    // LongBlockCase:
+    if (isShortApproach)
+        return {}; // not implemented, use reference implementation
+    return std::make_shared<jitGatherKernelForStaticShapes<isa, S, LongBlockCase, Long>>(); // partially implemented (some tests fails)
 }
 
 template <x64::cpu_isa_t isa, DataTypeSize S>

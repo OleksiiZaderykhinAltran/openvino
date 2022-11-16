@@ -186,6 +186,7 @@ struct gatherJitExecArgs {
 };
 
 struct GatherShapeParameters {
+    bool isDynamic;
     int axisDim = 0;
     uint64_t betweenBatchAndAxisSize = 0lu;
     uint64_t specIdxAndAfterAxSizeB = 0lu;
@@ -277,31 +278,56 @@ struct GatherShapeParameters {
     void fillPerThread(PerThread& p, uint64_t dstStart, uint64_t dstEnd) {
         p.workAmount = dstEnd - dstStart;
         p.dstStart = dstStart;
-        p.specIdxInBytes.resize(dataElPerVec);
-        p.idxBatchSumInBytes.resize(dataElPerVec);
-        p.dataBeforeAxisSumInBytes.resize(dataElPerVec);
-        p.betweenBatchAndAxisIter = (dstStart / specIndicesSize) % betweenBatchAndAxisSize;
-        for (uint64_t j = 0lu; j < dataElPerVec; j++) {
-            p.specIdxInBytes[j] = (((dstStart + j) / afterAxisSize) % specIndicesSize) * idxTypeSize;
-            p.idxBatchSumInBytes[j] = ((dstStart + j) / (betweenBatchAndAxisSize * specIndicesSize * afterAxisSize)) *
-                                      specIndicesSize * idxTypeSize;
-            p.dataBeforeAxisSumInBytes[j] = ((dstStart + j) / (specIndicesSize * afterAxisSize)) *
-                                            axisAndAfterAxisSizeInBytes;
+        if (isDynamic) {
+            if (afterAxisSize > 1) { // Blocked case
+                initIndices(p);
+            }
+        } else { // static shapes
+            if (afterAxisSize > idxElPerVec) { // Blocked Long case
+                p.specIdxInBytes.resize(dataElPerVec);
+                p.idxBatchSumInBytes.resize(dataElPerVec);
+                p.dataBeforeAxisSumInBytes.resize(dataElPerVec);
+                p.betweenBatchAndAxisIter = (p.dstStart / specIndicesSize) % betweenBatchAndAxisSize;
+                for (uint64_t j = 0lu; j < dataElPerVec; j++) {
+                    p.specIdxInBytes[j] = ((p.dstStart / afterAxisSize + j) % specIndicesSize) * idxTypeSize;
+                    p.idxBatchSumInBytes[j] = ((p.dstStart / afterAxisSize + j) / (betweenBatchAndAxisSize * specIndicesSize)) *
+                                              specIndicesSize * idxTypeSize;
+                    p.dataBeforeAxisSumInBytes[j] = ((p.dstStart / afterAxisSize + j) / (specIndicesSize)) *
+                                                    axisAndAfterAxisSizeInBytes;
+                }
+            } else {
+                initIndices(p);
+            }
         }
         initShortParams(p, dstStart);
     }
 
+    void initIndices(PerThread& p) {
+        p.specIdxInBytes.resize(dataElPerVec);
+        p.idxBatchSumInBytes.resize(dataElPerVec);
+        p.dataBeforeAxisSumInBytes.resize(dataElPerVec);
+        p.betweenBatchAndAxisIter = (p.dstStart / specIndicesSize) % betweenBatchAndAxisSize;
+        for (uint64_t j = 0lu; j < dataElPerVec; j++) {
+            p.specIdxInBytes[j] = (((p.dstStart + j) / afterAxisSize) % specIndicesSize) * idxTypeSize;
+            p.idxBatchSumInBytes[j] = ((p.dstStart + j) / (betweenBatchAndAxisSize * specIndicesSize * afterAxisSize)) *
+                                      specIndicesSize * idxTypeSize;
+            p.dataBeforeAxisSumInBytes[j] = ((p.dstStart + j) / (specIndicesSize * afterAxisSize)) *
+                                            axisAndAfterAxisSizeInBytes;
+        }
+    }
+
     void initShortParams(PerThread& p, const uint64_t start) {
-        fillBeforeAxisDiff(p.srcBeforeAxisDiff, start);
         if (afterAxisSize == 1) { // Elementwise gather.
             if (specIndicesSize >= idxElPerVec)
                 return; // Is not a short case.
 
+            fillBeforeAxisDiff(p.srcBeforeAxisDiff, start);
             fillPermIdxMask(p.permIdxMask);
         } else { // Blocked gather.
             if (afterAxisSize > idxElPerVec)
                 return; // Is not a short case.
 
+            fillBeforeAxisDiff(p.srcBeforeAxisDiff, start);
             p.afterAxIdxInBytes.resize(idxElPerVec);
             p.afterAxPermMask.resize(idxElPerVec);
             p.beforeAxPermMask.resize(idxElPerVec);
@@ -388,7 +414,7 @@ struct GatherShapeParameters {
             arg.permIdxMask = p.permIdxMask.data();
             arg.beforeAxisDiff = p.srcBeforeAxisDiff.data();
         } else if (afterAxisSize > 1) { // Blocked case.
-//            if (afterAxisSize <= dataElPerVec) { // Short case
+            if (afterAxisSize <= dataElPerVec) { // Short case
                 arg.afterAxIdxB = p.afterAxIdxInBytes.data();
                 arg.specIdxDiff = p.specIdxDiff.data();
                 arg.beforeAxisDiff = p.srcBeforeAxisDiff.data();
@@ -397,16 +423,9 @@ struct GatherShapeParameters {
                 arg.afterAxisSize = &afterAxisSize;
                 arg.specIdxAndAfterAxIterB = p.specIdxAndAfterAxIterB;
                 arg.specIdxAndAfterAxSizeB = specIdxAndAfterAxSizeB;
-//            } else { // Long case
-//                arg.afterAxIdxB = p.afterAxIdxInBytes.data();
-//                arg.specIdxDiff = p.specIdxDiff.data();
-//                arg.beforeAxisDiff = p.srcBeforeAxisDiff.data();
-//                arg.beforeAxisPermMask = p.beforeAxPermMask.data();
-//                arg.afterAxisPermMask = p.afterAxPermMask.data();
-//                arg.afterAxisSize = &afterAxisSize;
-//                arg.specIdxAndAfterAxIterB = p.specIdxAndAfterAxIterB;
-//                arg.specIdxAndAfterAxSizeB = specIdxAndAfterAxSizeB;
-//            }
+            } else { // Long case
+                arg.afterAxisSize = &afterAxisSize;
+            }
         }
         return arg;
     }
@@ -425,10 +444,13 @@ struct GatherShapeParameters {
         arg.betweenBatchAndAxisSize = &betweenBatchAndAxisSize;
         arg.specIndicesSize = &specIndicesSize;
         arg.workAmount = p.workAmount;
-        arg.specIdxB = p.specIdxInBytes.data();
-        arg.idxBatchSumB = p.idxBatchSumInBytes.data();
-        arg.dataBeforeAxisSumB = p.dataBeforeAxisSumInBytes.data();
-        arg.betweenBatchAndAxisIter = p.betweenBatchAndAxisIter;
+
+        if (afterAxisSize > 1) { // Blocked case
+            arg.specIdxB = p.specIdxInBytes.data();
+            arg.idxBatchSumB = p.idxBatchSumInBytes.data();
+            arg.dataBeforeAxisSumB = p.dataBeforeAxisSumInBytes.data();
+            arg.betweenBatchAndAxisIter = p.betweenBatchAndAxisIter;
+        }
 
         if (afterAxisSize == 1 && specIndicesSize < idxElPerVec) { // Elementwise short case.
             arg.permIdxMask = p.permIdxMask.data();
@@ -458,6 +480,7 @@ struct jitGatherKernelInterface {
     virtual ~jitGatherKernelInterface() = default;
     virtual void initialize(const jGatherConfParams& jcp) = 0;
     virtual bool isSameParams(const jGatherConfParams& jcp) = 0;
+    virtual bool isLongBlock() = 0;
     virtual void operator()(const gatherJitExecArgs *args) = 0;
     virtual void create_ker() = 0;
     static std::shared_ptr<jitGatherKernelInterface> createJitUniGatherKernel(x64::cpu_isa_t isa,
@@ -479,7 +502,8 @@ enum Approach {
 
 enum AfterAxisCase {
     ElementwiseCase,
-    BlockedCase
+    ShortBlockCase,
+    LongBlockCase
 };
 
 template <x64::cpu_isa_t isa>
@@ -544,7 +568,7 @@ protected:
     };
 
     template<typename unused>
-    struct ShiftCalculatorImpl<BlockedCase, Short, unused> : public ShiftCalculator {
+    struct ShiftCalculatorImpl<ShortBlockCase, Short, unused> : public ShiftCalculator {
         void allocateRegisters(jitGatherKernelBase& kernel) override;
         void uploadParamsForApproachSpecific(jitGatherKernelBase& kernel) override;
         std::tuple<poolVmask<isa> /*kDstMask*/, poolVmm<isa> /*vDstShifts*/> calcSrcShift(jitGatherKernelBase& kernel, bool shiftFirst) override;
@@ -567,26 +591,24 @@ protected:
     };
 
     template<typename unused>
-    struct ShiftCalculatorImpl<BlockedCase, Long, unused> : public ShiftCalculator {
+    struct ShiftCalculatorImpl<ShortBlockCase, Long, unused> : public ShiftCalculatorImpl<ShortBlockCase, Short> {};
+
+    template<typename unused>
+    struct ShiftCalculatorImpl<LongBlockCase, Long, unused> : public ShiftCalculator {
         void allocateRegisters(jitGatherKernelBase& kernel) override;
         void uploadParamsForApproachSpecific(jitGatherKernelBase& kernel) override;
         std::tuple<poolVmask<isa> /*kDstMask*/, poolVmm<isa> /*vDstShifts*/> calcSrcShift(jitGatherKernelBase& kernel, bool shiftFirst) override;
 
-        RegistersPool::Reg<Xbyak::Reg64> rSpecIdxAndAfterAxIterB;
-        RegistersPool::Reg<Xbyak::Reg64> rSpecIdxAndAfterAxSizeB;
-        RegistersPool::Reg<Xbyak::Reg64> rSpecIdxAndAfterAxSize;
-        RegistersPool::Reg<Xbyak::Reg64> rBeforeAxisSize;
-        RegistersPool::Reg<Xbyak::Reg64> rSpecIdxAndAfterAxisSizeIsPowerOf2;
-        RegistersPool::Reg<Xbyak::Reg64> rAfterAxisSizeIsPowerOf2;
-        RegistersPool::Reg<Xbyak::Reg64> rSpecIdxSize;
+        RegistersPool::Reg<Xbyak::Reg64> regBetweenBatchAndAxisSize;
+        RegistersPool::Reg<Xbyak::Reg64> regSpecIdxSizeB;
+        RegistersPool::Reg<Xbyak::Reg64> regBetweenBatchAndAxisIter;
+        RegistersPool::Reg<Xbyak::Reg64> regIdxIter;
+        RegistersPool::Reg<Xbyak::Reg64> regAfterAxSizeB;
 
-        RegisterValue<Vmm> vmmAxisAndAfterAxisSizeB;
-        RegistersPool::Reg<Vmm> vmmSrcAfterBatchSizeB;
-        RegistersPool::Reg<Vmm> vmmAfterAxisIdxB;
-        RegistersPool::Reg<Vmm> vmmAfterAxisPermMask;
-        RegistersPool::Reg<Vmm> vmmSpecIdxDiff;
+        RegistersPool::Reg<Vmm> vmmIdxBatchSumB;
+        RegistersPool::Reg<Vmm> vmmVecLenB;
+        RegistersPool::Reg<Vmm> vmmAxisAndAfterAxisSizeB;
         RegistersPool::Reg<Vmm> vmmAfterAxisSize;
-        RegistersPool::Reg<Vmm> vmmBeforeAxPermMask;
     };
 
 public:
@@ -609,6 +631,7 @@ protected:
     void uploadParamPtrWithVmovups(const Vmm& vmmDest, size_t offset);
     virtual ShiftCalculator& getShiftCalculator() { IE_THROW() << "Inconsistency in jitGatherKernelBase::getShiftCalculator()"; }
     void process(ShiftCalculator& shiftCalculator);
+    void processLongBlock(ShiftCalculator& shiftCalculator);
     virtual void processDataTypeSpecific(ShiftCalculator& shiftCalculator) = 0;
     void tail(ShiftCalculator& shiftCalculator, bool shiftFirst);
     poolVmm<isa> shiftIdxAndGather(ShiftCalculator& shiftCalculator, bool shiftFirst);
@@ -624,6 +647,9 @@ protected:
     poolVmm<isa> getRangeFromStart();
     std::tuple<poolVmm<isa> /*specIndices*/, poolVmm<isa> /*generalIndices*/> calculateSpecAndGenIndices(
             Vmm& vmmSpecIndicesSizeB);
+    void copyBlock(ShiftCalculator& shiftCalculator, poolVmask<isa>& kLoadMask, poolVmm<isa>& vmmCalculatedShifts);
+    void memCopy(RegistersPool::Reg<Xbyak::Reg32>& regSrcShift);
+    bool isLongBlock() override { return false; }
 
 protected:
     void (*ker_)(const gatherJitExecArgs *);
@@ -707,6 +733,7 @@ struct jitGatherKernelForStaticShapes : public jitGatherKernelForDataTypeSize<is
     DECLARE_CPU_JIT_AUX_FUNCTIONS(jitGatherKernelForDynamicity)
 protected:
     typename jitGatherKernelBase<isa>::ShiftCalculator& getShiftCalculator() override { return *shiftCalculator; }
+    bool isLongBlock() override { return C == LongBlockCase; }
 
     std::shared_ptr<typename jitGatherKernelBase<isa>::ShiftCalculator> shiftCalculator;
 };

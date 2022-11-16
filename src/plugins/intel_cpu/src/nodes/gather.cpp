@@ -92,6 +92,7 @@ Gather::Gather(const std::shared_ptr<ov::Node>& op, const dnnl::engine& eng,
     }
     shapeParameters.simdVecSize = x64::mayiuse(x64::avx512_core) ? x64::cpu_isa_traits<x64::avx512_core>::vlen :
                            x64::mayiuse(x64::avx2) ? x64::cpu_isa_traits<x64::avx2>::vlen : 16;
+    shapeParameters.isDynamic = isDynamicNode();
 }
 
 void Gather::initSupportedPrimitiveDescriptors() {
@@ -151,7 +152,13 @@ void Gather::initializePerThreadParams() {
         return;
     }
     const uint64_t nthr = parallel_get_max_threads();
-    const uint64_t workPerThread = ((shapeParameters.totalWork / shapeParameters.dataElPerVec) / nthr + 1) * shapeParameters.dataElPerVec;
+    uint64_t workPerThread;
+    if (jitKernel->isLongBlock()) {
+        auto blocksNum = shapeParameters.totalWork / shapeParameters.afterAxisSize;
+        workPerThread = (blocksNum / nthr + (blocksNum % nthr == 0 ? 0 : 1)) * shapeParameters.afterAxisSize;
+    } else {
+        workPerThread = ((shapeParameters.totalWork / shapeParameters.dataElPerVec) / nthr + 1) * shapeParameters.dataElPerVec;
+    }
     execParamsPerThread.resize(nthr);
 
     parallel_nt(nthr, [&](const int ithr, const int nthr) {
