@@ -152,7 +152,13 @@ void Gather::initializePerThreadParams() {
         return;
     }
     const uint64_t nthr = parallel_get_max_threads();
-    uint64_t workPerThread = ((shapeParameters.totalWork / shapeParameters.dataElPerVec) / nthr + 1) * shapeParameters.dataElPerVec;
+    uint64_t workPerThread;
+    if (jitKernel->isLongBlock()) {
+        auto blocksNum = shapeParameters.totalWork / shapeParameters.afterAxisSize;
+        workPerThread = (blocksNum / nthr + (blocksNum % nthr == 0 ? 0 : 1)) * shapeParameters.afterAxisSize;
+    } else {
+        workPerThread = ((shapeParameters.totalWork / shapeParameters.dataElPerVec) / nthr + 1) * shapeParameters.dataElPerVec;
+    }
     execParamsPerThread.resize(nthr);
 
     parallel_nt(nthr, [&](const int ithr, const int nthr) {

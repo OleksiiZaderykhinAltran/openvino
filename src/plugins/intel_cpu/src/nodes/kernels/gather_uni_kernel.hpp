@@ -16,7 +16,7 @@
 //        - Elementwise case
 //            - Short subcase  Implemented
 //            - Long subcase   Implemented
-//        - ShortBlock case    Not implemented
+//        - ShortBlock case    Implemented
 //        - LongBlock case     Not implemented
 //    - static shapes
 //        - Elementwise case
@@ -29,14 +29,14 @@
 //        - Elementwise case
 //            - Short subcase  Implemented
 //            - Long subcase   Implemented
-//        - ShortBlock case    Not implemented
+//        - ShortBlock case    Implemented
 //        - LongBlock case     Not implemented
 //    - static shapes
 //        - Elementwise case
 //            - Short subcase  Implemented
 //            - Long subcase   Implemented
-//        - ShortBlock case    Implemented only for 32 bit data types
-//        - LongBlock case     Not implemented
+//        - ShortBlock case    Implemented
+//        - LongBlock case     Partially implemented (some tests fails)
 //- SSE4.1                     Not implemented
 
 #pragma once
@@ -46,6 +46,7 @@
 
 #include <utility>
 #include "registers_pool.hpp"
+#include "stack_allocator.hpp"
 
 namespace ov {
 namespace intel_cpu {
@@ -65,7 +66,8 @@ struct RegisterValue {
     operator const TReg&() const { ensureValid(); return reg; }
     int getIdx() { ensureValid(); return reg.getIdx(); }
     bool isValueInRegister() { return reg.isInitialized(); }
-    bool isInitialized() { return this->isValueInRegister(); }
+    bool isValueInStack() { return static_cast<bool>(stackedReg); }
+    bool isInitialized() { return this->isValueInRegister() || isValueInStack(); }
 
     void initialize(RegistersPool::Ptr& pool, int requestedIdx = anyIdx) {
         if (isInitialized()) {
@@ -80,17 +82,38 @@ struct RegisterValue {
         }
         int idx = this->reg.getIdx();
         this->reg.release();
+        stackedReg.reset();
         return idx;
+    }
+    int saveToStack(std::shared_ptr<StackAllocator>& allocator) {
+        if (!this->isValueInRegister()) {
+            IE_THROW() << "The RegisterValue is ether not initialized or already saved to stack in RegisterValue::saveToStack()";
+        }
+        stackedReg = std::make_shared<StackAllocator::Reg<TReg>>(*allocator);
+        stack_mov(*stackedReg, this->reg);
+        int idx = this->reg.getIdx();
+        this->reg.release();
+        return idx;
+    }
+    void loadFromStack(RegistersPool::Ptr& pool, int requestedIdx = anyIdx) {
+        if (!isValueInStack()) {
+            IE_THROW() << "Inconsistency in RegisterValue::loadFromStack()";
+        }
+        this->reg = RegistersPool::Reg<TReg>{pool, requestedIdx};
+        stack_mov(this->reg, *stackedReg);
+        stackedReg.reset();
     }
 
     RegisterValue& operator=(RegisterValue&& other)  noexcept {
+        stackedReg = std::move(other.stackedReg);
         reg = std::move(other.reg);
         valueInitializer = std::move(other.valueInitializer);
         return *this;
     }
 
     RegisterValue(RegisterValue&& other)  noexcept
-            : reg(std::move(other.reg))
+            : stackedReg(std::move(other.stackedReg))
+            , reg(std::move(other.reg))
             , valueInitializer(std::move(other.valueInitializer)) {}
 
 private:
@@ -102,6 +125,7 @@ private:
 
 private:
     ValueInitializer valueInitializer;
+    std::shared_ptr<StackAllocator::Reg<TReg>> stackedReg;
     RegistersPool::Reg<TReg> reg;
 };
 
@@ -451,6 +475,7 @@ struct jitGatherKernelInterface {
     virtual ~jitGatherKernelInterface() = default;
     virtual void initialize(const jGatherConfParams& jcp) = 0;
     virtual bool isSameParams(const jGatherConfParams& jcp) = 0;
+    virtual bool isLongBlock() = 0;
     virtual void operator()(const gatherJitExecArgs *args) = 0;
     virtual void create_ker() = 0;
     static std::shared_ptr<jitGatherKernelInterface> createJitUniGatherKernel(x64::cpu_isa_t isa,
@@ -563,6 +588,24 @@ protected:
     template<typename unused>
     struct ShiftCalculatorImpl<ShortBlockCase, Long, unused> : public ShiftCalculatorImpl<ShortBlockCase, Short> {};
 
+    template<typename unused>
+    struct ShiftCalculatorImpl<LongBlockCase, Long, unused> : public ShiftCalculator {
+        void allocateRegisters(jitGatherKernelBase& kernel) override;
+        void uploadParamsForApproachSpecific(jitGatherKernelBase& kernel) override;
+        std::tuple<poolVmask<isa> /*kDstMask*/, poolVmm<isa> /*vDstShifts*/> calcSrcShift(jitGatherKernelBase& kernel, bool shiftFirst) override;
+
+        RegistersPool::Reg<Xbyak::Reg64> regBetweenBatchAndAxisSize;
+        RegistersPool::Reg<Xbyak::Reg64> regSpecIdxSizeB;
+        RegistersPool::Reg<Xbyak::Reg64> regBetweenBatchAndAxisIter;
+        RegistersPool::Reg<Xbyak::Reg64> regIdxIter;
+        RegistersPool::Reg<Xbyak::Reg64> regAfterAxSizeB;
+
+        RegistersPool::Reg<Vmm> vmmIdxBatchSumB;
+        RegistersPool::Reg<Vmm> vmmVecLenB;
+        RegistersPool::Reg<Vmm> vmmAxisAndAfterAxisSizeB;
+        RegistersPool::Reg<Vmm> vmmAfterAxisSize;
+    };
+
 public:
     void initialize(const jGatherConfParams& jcp) override;
     bool isSameParams(const jGatherConfParams& jcp) override;
@@ -601,6 +644,7 @@ protected:
             Vmm& vmmSpecIndicesSizeB);
     void copyBlock(ShiftCalculator& shiftCalculator, poolVmask<isa>& kLoadMask, poolVmm<isa>& vmmCalculatedShifts);
     void memCopy(RegistersPool::Reg<Xbyak::Reg32>& regSrcShift);
+    bool isLongBlock() override { return false; }
 
 protected:
     void (*ker_)(const gatherJitExecArgs *);
@@ -611,6 +655,7 @@ protected:
         Reg64(Operand::RCX), Reg64(Operand::RBP), Reg64(Operand::RDI),
         Xbyak::Opmask(0), // Do not use k0 with gather instruction. The k0 has special meaning there.
     });
+    std::shared_ptr<StackAllocator> stackAllocator;
     uint64_t simdVecSize = 16lu;
     uint64_t idxElPerVec = 1lu;
     uint64_t dataElPerVec = 1lu;
@@ -620,6 +665,7 @@ protected:
     uint64_t afterAxisSize = 0lu;
     bool reverseIndexing = true;
     bool dynamicShapes = false;
+    bool isLessSimdRegistersCase = false;
 
     const Xbyak::Reg64 regParams = Xbyak::Reg64(dnnl::impl::cpu::x64::abi_param_regs[0]);
     const RegistersPool::Reg<Xbyak::Reg64> regDst {regPool, 9};
@@ -682,6 +728,7 @@ struct jitGatherKernelForStaticShapes : public jitGatherKernelForDataTypeSize<is
     DECLARE_CPU_JIT_AUX_FUNCTIONS(jitGatherKernelForDynamicity)
 protected:
     typename jitGatherKernelBase<isa>::ShiftCalculator& getShiftCalculator() override { return *shiftCalculator; }
+    bool isLongBlock() override { return C == LongBlockCase; }
 
     std::shared_ptr<typename jitGatherKernelBase<isa>::ShiftCalculator> shiftCalculator;
 };
